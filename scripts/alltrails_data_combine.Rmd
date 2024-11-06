@@ -1,0 +1,41 @@
+---
+title: "combine_trail_tables"
+author: "Olivia Guswiler"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE}
+library(tidyverse)
+```
+
+## Import Trails
+
+```{r}
+# Set the path to alltrails folder
+folder_path <- "data_raw/all_trails"
+
+# List all CSV files in the folder
+file_list <- list.files(path = folder_path,
+                        pattern = "\\.csv$",
+                        full.names = TRUE)
+
+# Read each CSV file, add a filename column, and combine into a single data frame
+trail_df <- file_list %>%
+  map_dfr(~ read_csv(.x) %>% 
+            mutate(filename = basename(.x)))
+
+write_csv(trail_df, "data_raw/alltrails_coordinates.csv")
+
+trails <- read_csv("data_raw/alltrails_coordinates.csv")
+
+trails_vect <- vect(trails, crs = "EPSG:4326", geom = c("Longitude", "Latitude"))
+
+plot(trails_vect, cex = 0.3)
+```
+
+## 

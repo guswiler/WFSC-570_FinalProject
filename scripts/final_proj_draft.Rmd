@@ -1,0 +1,80 @@
+---
+title: "final_proj_draft"
+author: "Olivia Guswiler"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo = FALSE}
+library(tidyverse)
+library(terra)
+library(ggplot2)
+library(sp)
+```
+
+## Cleaning Data for Okanogan Study Area
+
+Need to adjust file placement in folders and then update code
+
+```{r}
+# referene data with study site info
+ref <- read_csv("data_raw/prugh_movebank_ref.csv") %>% 
+  select("animal-id", "study-site") %>% 
+  rename(ID = "animal-id", study_site =`study-site`)
+
+# all meso telemetry data
+all_data <- readRDS("scripts/test/WPPP_mesopredator_GPS_locations.rds") %>%
+  rename(date_time = Acquisition.Time,
+         Lat = GPS.Latitude, Long = GPS.Longitude, ID = AnimalID) %>% 
+  left_join(ref, "ID")
+
+# filter by study site, remove disperal data, and tidy
+data_ok <- all_data %>%
+  filter(study_site == "Okanogan") %>% 
+  group_by(ID) %>%
+  arrange(date_time) %>%
+  ungroup() %>%
+  mutate(Sp = ifelse(Species == "BOB", "Bobcat", "Coyote")) %>%
+  # excluding MVBOB71M after dispersal date
+  filter(ID != "MVBOB71M" | date_time < as.POSIXct("2019-09-24 00:00:00"))
+
+
+# Consider using their packages or just terra?
+  # SpatialPointsDataFrame(.[,c("Long", "Lat")],
+  #                        data = ., proj4string = CRS("EPSG:4326"))
+
+
+```
+
+## Landscape Covariates
+
+```{r}
+# USFS hiking trails 
+trails <- vect("data_raw/NF_trails/National Forest System Trails selection.shp",
+               crs = "EPSG:4326")
+
+  # set extent for defining all maps
+extent <- ext(trails)
+
+# USFS roads
+roads <- vect("data_raw/NF_roads/National Forest System Roads selection.shp") %>% 
+  project("EPSG:4326") %>% 
+  crop(extent)
+
+
+# human footprint index
+hfi <- rast("scripts/test/human_footprint_2019.tif") %>% 
+  crop(extent)
+
+plot(hfi)
+plot(trails, col = "beige", lwd = 0.5,
+     add = TRUE)
+plot(roads, col = "lightgray", lty = 2,
+     add = TRUE)
+
+# 
+```
