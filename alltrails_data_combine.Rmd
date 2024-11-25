@@ -17,7 +17,7 @@ library(tidyverse)
 
 ```{r}
 # Set the path to alltrails folder
-folder_path <- "data_raw/all_trails"
+folder_path <- "data_raw/Alltrails_csv"
 
 # List all CSV files in the folder
 file_list <- list.files(path = folder_path,
@@ -29,13 +29,9 @@ trail_df <- file_list %>%
   map_dfr(~ read_csv(.x) %>% 
             mutate(filename = basename(.x)))
 
+head(trail_df)
+
 write_csv(trail_df, "data_raw/alltrails_coordinates.csv")
-
-trails <- read_csv("data_raw/alltrails_coordinates.csv")
-
-trails_vect <- vect(trails, crs = "EPSG:4326", geom = c("Longitude", "Latitude"))
-
-plot(trails_vect, cex = 0.3)
 ```
 
 ## 

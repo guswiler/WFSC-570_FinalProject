@@ -1,0 +1,499 @@
+---
+as.line---
+title: "final_proj_draft"
+author: "Olivia Guswiler"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo = FALSE}
+library(tidyverse)
+library(terra)
+```
+
+## Preparing Data for Analyses
+
+### GPS Locations
+
+```{r}
+# reference data with study site info
+ref <- read_csv("data_raw/prugh_movebank_ref.csv") %>% 
+  select("animal-id", "study-site") %>% 
+  rename(ID = "animal-id", study_site =`study-site`)
+
+# all meso telemetry data
+all_data <- readRDS("data_raw/Prugh_provided_files/WPPP_mesopredator_GPS_locations.rds") %>%
+  rename(date_time = Acquisition.Time,
+         Lat = GPS.Latitude, Long = GPS.Longitude, ID = AnimalID) %>% 
+  left_join(ref, "ID")
+
+# filter by study site, remove disperal data, and tidy
+data_ok <- all_data %>%
+  filter(study_site == "Okanogan") %>% 
+  group_by(ID) %>%
+  arrange(date_time) %>%
+  ungroup() %>%
+  mutate(Sp = ifelse(Species == "BOB", "Bobcat", "Coyote")) %>%
+  # excluding MVBOB71M after dispersal date
+  filter(ID != "MVBOB71M" | date_time < as.POSIXct("2019-09-24 00:00:00"))
+
+# save as new RDS
+write_rds(data_ok, "outputs/Okanogan_GPS_locations.rds")
+```
+
+### Covariates
+
+-   need help with trail buffers
+
+```{r}
+buffer_800 <- focalMat(x = trails,           # data
+                       d = 800,          # dimensions of the buffer
+                       type=c('circle')) # shape of the buffer
+
+trail_800 <- focal(trails, w = buffer_800, fun = "mean")
+```
+
+Code chunk below is fine
+
+```{r}
+# Human Footprint Index (2019)
+hfi <- rast("data_raw/Prugh_provided_files/human_footprint_2019.tif") %>% 
+  # crop to trails extent
+  crop(trails) %>% 
+  # z-score standardize
+  scale()
+
+  # save as new file
+writeRaster(hfi, "outputs/hfi_cropped.tif",
+            overwrite = T)
+
+
+# Digital Elevation Model (2024)
+  # read in DEM sections
+D1 <- rast("rasters/USGS_13_n48w120_20240617.tif")
+D2 <- rast("rasters/USGS_13_n48w121_20240617.tif")
+D3 <- rast("rasters/USGS_13_n49w120_20240617.tif")
+D4 <- rast("rasters/USGS_13_n49w121_20240617.tif")
+
+  # merge sections into single raster layer
+D12 <- merge(D1, D2)
+D34 <- merge(D3, D4)
+DEM <- merge(D12, D34) %>% 
+  # reproject to appropriate crs
+  project("EPSG:4326", method = "bilinear") %>% 
+  crop(trails) %>% 
+  scale()
+
+  # rename layer for clarity
+names(DEM) <- "Elevation"
+
+writeRaster(DEM, "outputs/DEM_merged_cropped.tif",
+            overwrite = T)
+
+
+# Percent Tree Canopy Cover (2019)
+canopy <- rast("rasters/NLCD_CanopyCover.tiff") %>%
+  project("EPSG:4326", method = "bilinear") %>% 
+  crop(trails) %>% 
+  scale()
+
+names(canopy) <- "Canopy_Cover"
+
+writeRaster(canopy, "outputs/canopy.tif",
+            overwrite = T)
+
+  
+# Hiking Trails 
+trails <- rast("rasters/trail_raster.tif")
+
+  # make raster binary
+trails[is.na(trails)] <- 0  # change NA to 0
+trails[trails != 0] <- 1    # change !0 to 1
+
+names(trails) <- "Trails"
+
+writeRaster(trails, "outputs/trails_binary.tif",
+            overwrite = T)
+```
+
+## Step Length and Turn Angle
+
+```{r}
+# clear workspace 
+rm(list=ls())
+
+library(amt)
+```
+
+```{r}
+# load previously created file
+meso <- readRDS("outputs/Okanogan_GPS_locations.rds")
+
+    # bob <- meso %>% filter(Species == "BOB")
+    # coy <- meso %>% filter(Species == "COY")
+    # 
+    # ### BOBCAT
+    # bob_trk <- bob %>%
+    #   dplyr::select(ID, Species, Sex, date_time, Lat, Long) %>%
+    #   nest(.by = ID) %>%
+    #   mutate(trk = lapply(data, function(d){
+    #     make_track(d, .x = Long, .y = Lat, .t = date_time, crs = "EPSG:4326")}))
+    # 
+    # # summarise sampling rate by individual
+    # bob_trk %>% 
+    #   mutate(sr = lapply(trk, summarize_sampling_rate, time_unit = "hour")) %>%
+    #   dplyr::select(ID, sr) %>% unnest(cols = c(sr)) %>% 
+    #   arrange(median)
+    # 
+    # 
+    # # gamma and vm distributions
+    # bobcat1 <- bob_trk[bob_trk$ID != "MVBOB87M",] %>% # exclude due to few bursts
+    #   # drop individuals with fewer than 50 points  
+    #   filter(map_int(trk, nrow) > 50) %>% 
+    #   mutate(stp = map(trk, ~ .x %>%
+    #                      track_resample(rate = hours(4), tolerance = minutes(10)) %>%
+    #                      filter_min_n_burst(min_n = 3) %>%
+    #                      # calculate step lengths
+    #                      steps_by_burst() %>% 
+    #                      # draw 10 random points based on gamma and vonmises dists
+    #                      random_steps(sl_distr = fit_distr(.$sl_, "gamma"),
+    #                                   ta_distr = fit_distr(.$ta_, "vonmises"),
+    #                                   n_control = 10) %>% 
+    #                      # calculate log(sl) and cos(ta)
+    #                      mutate(log_sl_ = log(sl_ + .1), cos_ta = cos(ta_)))) %>%
+    #   unnest(cols = stp) %>%
+    #   left_join(distinct(data.frame(meso)[,c("ID", "Sex", "Species")])) %>%
+    #   mutate(case_binary = ifelse(case_ == TRUE, 1, 0))
+    # 
+    # 
+    # 
+    # 
+    # 
+    # ## SSF Test
+    # 
+    # bobcat2 <- bobcat1 %>% 
+    #   mutate(ssf = lapply(trk, function(x) {
+    #     x %>% extract_covariates(canopy) %>% 
+    #       mutate(canopy = canopy)
+    #       fit_issf(case_ ~ canopy + strata(step_id_))
+    #   }))
+    # 
+    # forest_pc = raster::extract(forest_pc[[c(grep(i, names(forest_pc)))]], .[,c("x2_","y2_")])
+    # 
+    # 
+    # 
+    # 
+    # ## Above, I separated species first and edited to try and match ssf better from amt publication...
+
+# select variables, nest by individual animal, and make 'amt' track
+meso_track <- meso %>%
+  data.frame() %>%
+  dplyr::select(ID, Species, Sex, date_time, Lat, Long) %>%
+  nest(.by = ID) %>%
+  mutate(trk = lapply(data, function(d){
+    make_track(d, .x = Long, .y = Lat, .t = date_time, crs = "EPSG:4326")}))
+
+# summarise sampling rate by individual
+track_summary <- meso_track %>% 
+  mutate(sr = lapply(trk, summarize_sampling_rate, time_unit = "hour")) %>%
+  dplyr::select(ID, sr) %>% unnest(cols = c(sr)) %>% 
+  left_join(distinct(data.frame(meso)[,c("ID", "Sex", "Species")])) %>%
+  arrange(Species, median)
+print(track_summary)
+
+
+# separate by species, unnest
+bobcat <- meso_track %>% filter(grepl("BOB", ID))
+coyote <- meso_track %>% filter(grepl("COY", ID))
+
+
+# calculate available points from sl and ta empirical distributions
+  # BOBCAT
+bobcat1 <- bobcat[bobcat$ID != "MVBOB87M",] %>% # exclude due to few bursts
+  # drop individuals with fewer than 50 points  
+  filter(map_int(trk, nrow) > 50) %>% 
+  mutate(stp = map(trk, ~ .x %>%
+                     track_resample(rate = hours(4), tolerance = minutes(10)) %>%
+                     filter_min_n_burst(min_n = 3) %>%
+                     # calculate step lengths
+                     steps_by_burst() %>% 
+                     # draw 10 random points based on gamma and vonmises dists
+                     random_steps(sl_distr = fit_distr(.$sl_, "gamma"),
+                                  ta_distr = fit_distr(.$ta_, "vonmises"),
+                                  n_control = 10) %>% 
+                     # calculate log(sl) and cos(ta)
+                     mutate(log_sl_ = log(sl_ + .1), cos_ta = cos(ta_)))) %>% 
+  dplyr::select(-data, -trk) %>%
+  unnest(cols = stp) %>%
+  left_join(distinct(data.frame(meso)[,c("ID", "Sex", "Species")])) %>%
+  mutate(case_binary = ifelse(case_ == TRUE, 1, 0))
+
+  # COYOTE
+coyote1 <- coyote %>%  
+  filter(map_int(trk, nrow) > 50) %>% 
+  mutate(stp = map(trk, ~ .x %>%
+                     track_resample(rate = hours(4), tolerance = minutes(10)) %>%
+                     filter_min_n_burst(min_n = 3) %>%
+                     steps_by_burst() %>% 
+                     random_steps(sl_distr = fit_distr(.$sl_, "gamma"),
+                                  ta_distr = fit_distr(.$ta_, "vonmises"),
+                                  n_control = 10) %>% 
+                     mutate(log_sl_ = log(sl_ + .1), cos_ta = cos(ta_)))) %>% 
+  dplyr::select(-data) %>%
+  unnest(cols = stp) %>%
+  left_join(distinct(data.frame(meso)[,c("ID", "Sex", "Species")])) %>%
+  mutate(case_binary = ifelse(case_ == TRUE, 1, 0))
+
+# save data as RDS
+write_rds(bobcat1, "outputs/bobcat_steps.rds")
+write_rds(coyote1, "outputs/coyote_steps.rds")
+```
+
+## Pull Covs at Steps
+
+sample size
+
+-   bobcat = 17
+
+-   coyote = 18
+
+```{r}
+# clear workspace 
+rm(list=ls())
+
+library(geosphere)
+library(raster)
+
+# load previously created files
+trails <- rast("outputs/trails_binary.tif")
+elev <- rast("outputs/DEM_merged_cropped.tif")
+canopy <- rast("outputs/canopy.tif")
+hfi <- rast("outputs/hfi_cropped.tif")
+bob_stp <- readRDS("outputs/bobcat_steps.rds")
+coy_stp <- readRDS("outputs/coyote_steps.rds")
+```
+
+```{r}
+# Change step lengths from degrees to meters, define season
+bob_stp <- bob_stp %>% 
+  dplyr::select(-sl_, -log_sl_) %>%
+  mutate(# step lengths from amt are in degrees; overwrite to meters
+         sl_ = distGeo(.[,c("x1_","y1_")],.[,c("x2_","y2_")])) %>% 
+  mutate(log_sl = log(sl_),
+         # Define season
+         season = ifelse(month(t2_) %in% 4:11, "summer", "winter"))
+
+coy_stp <- coy_stp %>% 
+  dplyr::select(-sl_, -log_sl_) %>%
+  mutate(# step lengths from amt are in degrees; overwrite to meters
+         sl_ = distGeo(.[,c("x1_","y1_")],.[,c("x2_","y2_")])) %>% 
+  mutate(log_sl = log(sl_),
+         # Define season
+         season = ifelse(month(t2_) %in% 4:11, "summer", "winter"))
+```
+
+```{r}
+### Trail buffers not included, but all works
+
+# Extract predictors
+bob_stp1 <- data.frame()
+for(j in unique(bob_stp$season)) { # for each season
+  print(j)
+  dat <- bob_stp %>% filter(season == j) %>% 
+      # forest cover
+    mutate(canopy = raster::extract(canopy, .[,c("x2_","y2_")]),
+           human_footprint = raster::extract(hfi, .[,c("x2_","y2_")]),
+           elevation = raster::extract(elev, .[,c("x2_","y2_")]))
+  bob_stp1 <- rbind(bob_stp1, dat)
+  }
+  
+coy_stp1 <- data.frame()
+for(j in unique(coy_stp$season)) { # for each season
+  print(j)
+  dat <- coy_stp %>% filter(season == j) %>% 
+      # forest cover
+    mutate(canopy = raster::extract(canopy, .[,c("x2_","y2_")]),
+           human_footprint = raster::extract(hfi, .[,c("x2_","y2_")]),
+           elevation = raster::extract(elev, .[,c("x2_","y2_")]))
+  coy_stp1 <- rbind(coy_stp1, dat)
+  }
+
+
+# read fully pre-processed data for SSF
+bob_stp2 <- bob_stp1 %>% 
+  # create unique step ID for each animal
+  mutate(step_id_ = paste(ID, step_id_, sep = "_"),
+         human_footprint = human_footprint,
+         canopy = canopy,
+         elevation = elevation) %>%
+  group_by(ID) %>% 
+  # calculate sample size for each animal (dividing by 11 because of available points)
+  mutate(n = n()/11) %>%
+  ungroup()
+
+coy_stp2 <- coy_stp1 %>% 
+  # create unique step ID for each animal
+  mutate(step_id_ = paste(ID, step_id_, sep = "_"),
+         human_footprint = human_footprint,
+         canopy = canopy,
+         elevation = elevation) %>%
+  group_by(ID) %>% 
+  # calculate sample size for each animal (dividing by 11 because of available points)
+  mutate(n = n()/11) %>%
+  ungroup()
+
+# Save fully processed data for SSF
+saveRDS(bob_stp2, "outputs/bob_stp2.rds")
+saveRDS(coy_stp2, "outputs/coy_stp2.rds")
+```
+
+## 
+
+```{r}
+library(parallel)
+library(glmmTMB)
+
+
+# read fully processed data for SSFs
+coy_ssf_dat <- readRDS("outputs/coy_stp2.rds")  %>% 
+  # select coyotes with more than 100 fixes
+  filter(n >= 100)
+
+
+
+m1 <- coy_ssf_dat %>% mutate(ssf = lapply(trk, function(x) {
+  x %>% fit_issf(case_ ~ elevation + strata(step_id_))
+}))
+
+
+
+
+# # plots showing bi-variate density of data, with respect to humans and large carnivores, showing that it is rare to have both high human and high large carnivore
+# # function to create bivariate density plots
+# hex_plot_fun <- function(dat, yvar, ylab, title_) {
+#   ggplot(dat , aes(human_footprint, get(yvar))) +
+#     geom_bin_2d(aes(fill = stat(log(density)))) +
+#     scale_fill_continuous(type = "viridis", limits=c(-14,-1)) +
+#     theme_bw() +
+#     labs(x = "human footprint", y = ylab, title = title_)+
+#     theme(plot.title = element_text(hjust = 0.5), legend.position = "none")+
+#     stat_density_2d(colour = "red", breaks = c(0.05), n = 15, size = 1)+
+#     geom_vline(xintercept = 0, colour = "gray70", size = 1) +
+#     geom_hline(yintercept = 0, colour = "gray70", size = 1)
+# }
+# hex1 <- hex_plot_fun(dat = coy_ssf_dat, yvar = "wolfUD", ylab = "Wolf UD", title_ = "Human and wolf"); hex1
+# hex2 <- hex_plot_fun(dat = coy_ssf_dat, yvar = "cougarUD", ylab = "Cougar UD", title_ = "Human and cougar"); hex2
+
+# fit SSF with glmmTMB following Muff et al (2020) JAE
+ncore <- min(parallel::detectCores()) - 2
+glmmTMB_coy <-  glmmTMB(case_ ~ human_footprint + I(human_footprint^2) + (0 + human_footprint | ID) + (0 + I(human_footprint^2) | ID) + 
+                          canopy + I(canopy^2) + (0 + canopy | ID) + (0 + I(canopy^2) | ID) +
+                          elevation + I(elevation^2) + (0 + elevation | ID) + (0 + I(elevation^2) | ID) +
+                          # control for step length
+                          log_sl + (0 + log_sl | ID) + 
+                          # strata
+                          (1|step_id_),
+                          family=poisson, doFit=T,
+                          data = coy_ssf_dat, 
+                          # Tell glmmTMB not to change the last standard deviation, all other values are estimated freely
+                          map = list(theta = factor(c(1:9, NA))),
+                          # Set the value of the standard deviation of the strata (the last ranef) to large constant value
+                          start = list(theta = c(rep(0, times = 9),log(1000))),
+                          control = glmmTMBControl(parallel = ncore)) 
+#saveRDS(glmmTMB_coy, "Analysis/glmmTMB_coy_20230215_minusToPlusScale.rds")
+#glmmTMB_coy <- readRDS("Analysis/glmmTMB_coy_20230215_minusToPlusScale.rds")
+summary(glmmTMB_coy)
+
+
+
+
+data
+
+elev <- coy_ssf_dat %>% select(!!names(elevation))
+
+
+test_ssf <- fit_ssf(coy_ssf_dat, case_ ~ "human_footprint$CumulativeImpacts_HF" +
+                      "elevation$Elevation" +
+                      "cover$Canopy_Cover" + 
+                      strata(step_id_),
+                    model = TRUE)
+```
+
+# Graphs for Results Draft
+
+```{r}
+# Making graphs for draft of results
+library(ggplot2)
+library(terra)
+
+meso <- readRDS("outputs/Okanogan_GPS_locations.rds")
+
+bob_vect <- meso %>% 
+  filter(Species == "BOB") %>% 
+  vect(geom=c("E", "N"), crs="EPSG:32610")
+
+coy_vect <- meso %>% 
+  filter(Species == "COY") %>% 
+  vect(geom=c("Long", "Lat"), crs="EPSG:4326")
+
+trail_vect <- vect("data_raw/Trails/Trails.shp")
+
+
+plot(hfi, col = map.pal("sepia"),
+     main = "Human Footprint")
+lines(trail_vect, lwd = 0.4,
+     col = "brown2")
+points(bob_vect, cex = 0.3, alpha = 0.6,
+       col = "darkolivegreen3")
+points(coy_vect, cex = 0.3, alpha = 0.6,
+       col = "cadetblue1")
+
+```
+
+```{r}
+## plotting sl and ta for an individual
+bob_stp2_t_indv <- read_rds("outputs/bob_stp2.rds") %>% 
+  filter(case_ == "TRUE", ID == "MVBOB51M")
+
+bob_gamma <- fit_distr(bob_stp2_t_indv$sl_, "gamma")
+
+
+library(circular)
+
+hist(bob_stp2_t_indv$sl_, freq = FALSE,
+     xlim = c(-10,2500),
+     breaks = 14,
+     ylim = c(0, 0.0015),
+     main = "Bobcat \"MVBOB51M\" Observed Steps",
+     xlab = "Step Length (m)")
+curve(dgamma(x, 
+             shape = bob_gamma$params$shape,
+             scale = bob_gamma$params$scale),
+      from = -10,
+      to = 2500,
+      add = T,
+      lwd = 2,
+      col = "red")
+
+
+ta_VM <- fit_distr(bob_stp2_t_indv$ta_, "vonmises")
+
+hist(bob_stp2_t_indv$ta_, freq = FALSE,
+     main = "Observed Turn Angles",
+     xlab = "Turn Angle (radians)")
+
+TA_dist <- data.frame(x = seq(-3.5, 3.5, length.out = 331))
+TA_dist$y <- circular::dvonmises(
+  x = TA_dist$x, 
+  mu = ta_VM$params$mu,
+  kappa = ta_VM$params$kappa)
+
+hist(bob_stp2_t$ta_, freq = FALSE,
+     main = "Bobcat \"MVBOB51M\" Observed Turn Angles",
+     xlab = "Turn Angle (radians)")
+lines(y~x, TA_dist, lwd = 2, col = "red")
+```
