@@ -33,23 +33,23 @@ write_rds(data_ok, "outputs/Okanogan_GPS_locations.rds")
 #### Tidy Covariate Data ####
 
 ## Hiking Trails 
-trails <- rast("rasters/trail_raster.tif") %>% 
+trail <- rast("rasters/trail_raster.tif") %>% 
   # reproject to appropriate crs
   project("EPSG:32610", method = "bilinear")
 
 # make data binary
-trails[!is.na(trails)] <- 1  # change any values to 1
-
-# give data meaningful name
-names(trails) <- "trails"
+trail[!is.na(trails)] <- 1  # change any values to 1
 
 # save raster
-writeRaster(trails, "outputs/trails.tif",
+writeRaster(trail, "outputs/trail.tif",
             overwrite = T)
+
+# give data meaningful name
+names(trail) <- "trail_dist"
 
 # Calculate Euclidean distance to trails
 trail_dist <- distance(trails,
-                            filename = "outputs/distance_from_trail.tif",
+                            filename = "outputs/trail_dist.tif",
                             filetype = "GTiff", gdal = c("COMPRESS=DEFLATE", "BIGTIFF=YES"),
                             overwrite = T)
 
@@ -60,6 +60,8 @@ hfi <- rast("data_raw/Prugh_provided_files/human_footprint_2019.tif") %>%
   project("EPSG:32610", method = "bilinear") %>% 
   # crop to trails extent
   crop(trails)
+
+names(hfi) <- "hfi_0"
 
 # save as new file
 writeRaster(hfi, "outputs/hfi.tif",
@@ -83,9 +85,9 @@ DEM <- merge(D12, D34) %>%
   crop(trails)
 
 # rename layer for clarity
-names(DEM) <- "Elevation"
+names(DEM) <- "elev_0"
 
-writeRaster(DEM, "outputs/DEM.tif",
+writeRaster(DEM, "outputs/elevation.tif",
             overwrite = T)
 
 
@@ -95,7 +97,7 @@ canopy <- rast("rasters/NLCD_CanopyCover.tiff") %>%
   project("EPSG:32610", method = "bilinear") %>% 
   crop(trails)
 
-names(canopy) <- "Canopy_Cover"
+names(canopy) <- "canopy_0"
 
 writeRaster(canopy, "outputs/canopy.tif",
             overwrite = T)
@@ -146,8 +148,9 @@ bobcat1 <- bobcat[bobcat$ID != "MVBOB87M",] %>% # exclude due to few bursts
                      random_steps(sl_distr = fit_distr(.$sl_, "gamma"),
                                   ta_distr = fit_distr(.$ta_, "vonmises"),
                                   n_control = 10) %>% 
-                     # calculate cos(ta)
-                     mutate(cos_ta = cos(ta_)))) %>% 
+                     # calculate log of step length and cos of turn angle
+                     mutate(cos_ta_ = cos(ta_),
+                            log_sl_ = log(sl_)))) %>% 
   dplyr::select(-data, -trk) %>%
   unnest(cols = stp) %>%
   left_join(distinct(data.frame(meso)[,c("ID", "Sex", "Species")])) %>%
@@ -165,7 +168,8 @@ coyote1 <- coyote %>%
                      random_steps(sl_distr = fit_distr(.$sl_, "gamma"),
                                   ta_distr = fit_distr(.$ta_, "vonmises"),
                                   n_control = 10) %>% 
-                     mutate(cos_ta = cos(ta_)))) %>% 
+                     mutate(cos_ta_ = cos(ta_),
+                            log_sl_ = log(sl_)))) %>% 
   dplyr::select(-data, -trk) %>%
   unnest(cols = stp) %>%
   left_join(distinct(data.frame(meso)[,c("ID", "Sex", "Species")])) %>%
@@ -175,38 +179,22 @@ coyote1 <- coyote %>%
 write_rds(bobcat1, "outputs/bobcat_steps.rds")
 write_rds(coyote1, "outputs/coyote_steps.rds")
 
-#### Determine Scales of Effect ####
+#### Create Raster Buffers ####
 rm(list=ls())
 
-library(doParallel)
-library(foreach)
-
-trail <- rast("outputs/distance_from_trail.tif")
-elev <- rast("outputs/DEM.tif")
+trail <- rast("outputs/distance_to_trail.tif")
+elev <- rast("outputs/elevation.tif")
 canopy <- rast("outputs/canopy.tif")
 hfi <- rast("outputs/hfi.tif")
 bobcat_end <- readRDS("outputs/bobcat_steps.rds") %>%
   select(x2_, y2_, case_binary)
 
 
-    # # extract covariate values at point
-    # point_elev <- terra::extract(elev,
-    #                              bobcat_end[,c("x2_","y2_")])
-    # 
-    # head(point_elev)
-    # 
-    # # add new column to bobcat_end data frame
-    # bobcat_end$Elev_0 <- point_elev$Elevation
-    # 
+# set range of buffers
+buffer_sizes = seq(100, 1000, by = 100)
 
 
-######
-# set buffer range
-buffer_sizes <- seq(100,300,by=100)
-
-
-# buffer raster maps ####
-## Elevation
+  ## Elevation
 for (i in 1:length(buffer_sizes)) {
   buff_i <- buffer_sizes[i]
   cat("Starting buffer size =",buff_i,"\n")
@@ -219,12 +207,12 @@ for (i in 1:length(buffer_sizes)) {
   names(elev)[which(names(elev)=="TMP")] <- paste0("Elev_",buff_i)
 }
 
-#SAVE
+# save
 writeRaster(elev, "outputs/elevation_buffers.tif",
             overwrite = T)
 
 
-## hfi
+  ## Human Footprint Index
 for (i in 1:length(buffer_sizes)) {
   buff_i <- buffer_sizes[i]
   cat("Starting buffer size =",buff_i,"\n")
@@ -240,7 +228,7 @@ for (i in 1:length(buffer_sizes)) {
 writeRaster(hfi, "outputs/hfi_buffers.tif",
             overwrite = T)
 
-## trail
+  ## Distance to Trails
 for (i in 1:length(buffer_sizes)) {
   buff_i <- buffer_sizes[i]
   cat("Starting buffer size =",buff_i,"\n")
@@ -257,7 +245,10 @@ writeRaster(trail, "outputs/trail_buffers.tif",
             overwrite = T)
 
 
-## canopy #### TRY CANOPY FIRST, it has the lowest resolution ####
+  ## Percent Canopy Cover 
+# change values over 87 to NA, these are an error from reprojection
+canopy[canopy>87] <- NA
+
 for (i in 1:length(buffer_sizes)) {
   buff_i <- buffer_sizes[i]
   cat("Starting buffer size =",buff_i,"\n")
@@ -275,135 +266,314 @@ writeRaster(canopy, "outputs/canopy_buffers.tif",
 
 
 
-
 #### Extract Covariates ####
-
-
-### Need to z-score standardize here ###
-
 rm(list=ls())
 
-library(geosphere)
 library(raster)
 
 # load previously created files
-trail <- rast("outputs/distance_from_trail.tif")
-elev <- rast("outputs/DEM.tif")
-canopy <- rast("outputs/canopy.tif")
-hfi <- rast("outputs/hfi.tif")
+trail <- rast("outputs/trail_dist.tif")
+elev <- rast("outputs/elevation_buffers.tif")
+canopy <- rast("outputs/canopy_buffers.tif")
+hfi <- rast("outputs/hfi_buffers.tif")
 bobcat_extract <- readRDS("outputs/bobcat_steps.rds")
-coyote2 <- readRDS("outputs/coyote_steps.rds")
+coyote_extract <- readRDS("outputs/coyote_steps.rds")
 
 
-# Change step lengths from degrees to meters, define season
+# define season and set weights
 bobcat_extract <- bobcat_extract %>% 
-  dplyr::select(-sl_) %>%
-  mutate(# step lengths from amt are in degrees; overwrite to meters
-    sl_ = distGeo(.[,c("x1_","y1_")],.[,c("x2_","y2_")])) %>% 
-  mutate(log_sl_ = log(sl_),
-         # Define season
-         season = ifelse(month(t2_) %in% 4:11, "summer", "winter"))
+  mutate(season = ifelse(month(t2_) %in% 4:11, "summer", "winter"),
+         w = ifelse(bobcat_extract$case_binary==1,1,10000))
+coyote_extract <- coyote_extract %>% 
+  mutate(season = ifelse(month(t2_) %in% 4:11, "summer", "winter"),
+         w = ifelse(coyote_extract$case_binary==1,1,10000))
 
 
+# extract covariates
+bobcat_canopy <- raster::extract(canopy, bobcat_extract[,c("x2_","y2_")]) %>%
+  dplyr::select(-ID) %>% 
+  cbind(bobcat_extract)
+coyote_canopy <- raster::extract(canopy, coyote_extract[,c("x2_","y2_")]) %>%
+  dplyr::select(-ID) %>% 
+  cbind(coyote_extract)
 
-##### Trying to extract covariates #####
+bobcat_elev <- raster::extract(elev, bobcat_extract[,c("x2_","y2_")]) %>%
+  dplyr::select(-ID) %>% 
+  cbind(bobcat_extract)
+coyote_elev <- raster::extract(elev, coyote_extract[,c("x2_","y2_")]) %>%
+  dplyr::select(-ID) %>% 
+  cbind(coyote_extract)
 
-bobcat_extracted1 <- data.frame()
-for(j in unique(bobcat_extract$season)) { # for each season within each year
-  print(j)
-  dat <- bobcat_extract %>% filter(season == j) %>% 
-    # % forest cover
-    mutate(hfi = raster::extract(hfi, .[,c("x2_","y2_")]))
-  bobcat_extracted1 <- rbind(bobcat_extracted1, dat)
+bobcat_hfi <- raster::extract(hfi, bobcat_extract[,c("x2_","y2_")]) %>%
+  dplyr::select(-ID) %>% 
+  cbind(bobcat_extract)
+coyote_hfi <- raster::extract(hfi, coyote_extract[,c("x2_","y2_")]) %>%
+  dplyr::select(-ID) %>% 
+  cbind(coyote_extract)
+
+
+# Bobcat: determine scales of effect
+  ## hfi
+# create data frame to hold AIC values for comparison
+hfi_scales_b <- data.frame(covariate = "hfi",
+                            scale = seq(0,1000,by = 100),
+                            AIC = NA,
+                           delta_AIC = NA)
+
+# for loop to calculate AICs and enter in df
+for(i in 1:nrow(hfi_scales_b)){
+  cov_i <- paste0(hfi_scales_b$covariate[i],"_",hfi_scales_b$scale[i])
+  data_i <- bobcat_hfi[,c("case_",cov_i)]
+  model_i <- glm(data_i[,1] ~ data_i[,2], data = data_i, family = poisson, weights = bobcat_hfi$w)
+  hfi_scales_b$AIC[i] <- AIC(model_i)
+}
+# for loop to calculate delta AIC values
+for (i in 1:length(hfi_scales_b)) {
+  min_i <- min(hfi_scales_b$AIC)
+  hfi_scales_b$delta_AIC <- hfi_scales_b$AIC - min_i
 }
 
+# lowest AIC value
+hfi_scales_b[which(hfi_scales_b$AIC==min(hfi_scales_b$AIC)),]
+# hfi_800
 
 
-bob_test <- raster::extract(hfi, bobcat_extract[,c("x2_","y2_")])
+  ## canopy
+canopy_scales_b <- data.frame(covariate = "canopy",
+                         scale = seq(0,1000,by = 100),
+                         AIC = NA,
+                         delta_AIC = NA)
 
-
-
-# Extract predictors
-bobcat2 <- data.frame()
-for(j in unique(bobcat1$season)) { # for each season
-  print(j)
-  dat <- bobcat1 %>% filter(season == j) %>% 
-    # forest cover
-    mutate(canopy = raster::extract(canopy, .[,c("x2_","y2_")]),
-           human_footprint = raster::extract(hfi, .[,c("x2_","y2_")]),
-           elevation = raster::extract(elev, .[,c("x2_","y2_")]))
-  bobcat2 <- rbind(bobcat2, dat)
+for(i in 1:nrow(canopy_scales_b)){
+  cov_i <- paste0(canopy_scales_b$covariate[i],"_",canopy_scales_b$scale[i])
+  data_i <- bobcat_canopy[,c("case_",cov_i)]
+  model_i <- glm(data_i[,1] ~ data_i[,2], data = data_i, family = poisson, weights = bobcat_canopy$w)
+  canopy_scales_b$AIC[i] <- AIC(model_i)
+}
+for (i in 1:length(canopy_scales_b)) {
+  min_i <- min(canopy_scales_b$AIC)
+  canopy_scales_b$delta_AIC <- canopy_scales_b$AIC - min_i
 }
 
-coy_stp1 <- data.frame()
-for(j in unique(coy_stp$season)) { # for each season
-  print(j)
-  dat <- coy_stp %>% filter(season == j) %>% 
-    # forest cover
-    mutate(canopy = raster::extract(canopy, .[,c("x2_","y2_")]),
-           human_footprint = raster::extract(hfi, .[,c("x2_","y2_")]),
-           elevation = raster::extract(elev, .[,c("x2_","y2_")]))
-  coy_stp1 <- rbind(coy_stp1, dat)
+canopy_scales_b[which(canopy_scales_b$AIC==min(canopy_scales_b$AIC)),]
+# canopy_0
+
+
+    ## elevation
+elev_scales_b <- data.frame(covariate = "elev",
+                            scale = seq(0,1000,by = 100),
+                            AIC = NA,
+                            delta_AIC = NA)
+
+for(i in 1:nrow(elev_scales_b)){
+  cov_i <- paste0(elev_scales_b$covariate[i],"_",elev_scales_b$scale[i])
+  data_i <- bobcat_elev[,c("case_",cov_i)]
+  model_i <- glm(data_i[,1] ~ data_i[,2], data = data_i, family = poisson, weights = bobcat_elev$w)
+  elev_scales_b$AIC[i] <- AIC(model_i)
+}
+for (i in 1:length(elev_scales_b)) {
+  min_i <- min(elev_scales_b$AIC)
+  elev_scales_b$delta_AIC <- elev_scales_b$AIC - min_i
 }
 
+elev_scales_b[which(elev_scales_b$AIC==min(elev_scales_b$AIC)),]
+# elev_200
 
-# read fully pre-processed data for SSF
-bob_stp2 <- bob_stp1 %>% 
+
+# bind scales of effect for all covariates and z-score standardize
+hfi_b <- dplyr::select(bobcat_hfi, hfi_800) %>% 
+  mutate(zhfi_800 = scale(hfi_800))
+canopy_b <- dplyr::select(bobcat_canopy, canopy_0) %>%
+  mutate(zcanopy_0 = scale(canopy_0))
+elev_b <- dplyr::select(.data = bobcat_elev, elev_200) %>%
+  mutate(zelev_200 = scale(elev_200))
+trail_b <- raster::extract(trail, bobcat_extract[,c("x2_","y2_")]) %>%
+  dplyr::select(-ID) %>% 
+  mutate(ztrail_dist = scale(trail_dist))
+
+bobcat_extract1 <- cbind(hfi_b, canopy_b, elev_b, trail_b, 
+                         bobcat_extract)
+
+
+# plot scales of effect
+par(mfrow=c(1,3))
+plot(delta_AIC ~ scale, hfi_scales_b,
+     type = "b",
+     xlab = "",
+     ylab = expression(paste(Delta, " AIC")),
+     main = "Human Footprint Index")
+plot(delta_AIC ~ scale, canopy_scales_b,
+     type = "b",
+     xlab = "Scale (buffer radius in meters)",
+     ylab = "",
+     main = "Percent Canopy Cover")
+plot(delta_AIC ~ scale, elev_scales_b,
+     type = "b",
+     xlab = "",
+     ylab = "",
+     main = "Elevation")
+
+mtext(expression(bold("Bobcat Scales of Effect")),
+      at=-1000, line=3,
+      cex=1)
+par(mfrow=c(1,1))
+
+save.image("outputs/bobcat_sof.png")
+
+# Coyote: determine scales of effect
+  ## hfi
+hfi_scales_c <- data.frame(covariate = "hfi",
+                           scale = seq(0,1000,by = 100),
+                           AIC = NA,
+                           delta_AIC = NA)
+
+for(i in 1:nrow(hfi_scales_c)){
+  cov_i <- paste0(hfi_scales_c$covariate[i],"_",hfi_scales_c$scale[i])
+  data_i <- coyote_hfi[,c("case_",cov_i)]
+  model_i <- glm(data_i[,1] ~ data_i[,2], data = data_i, family = poisson, weights = coyote_hfi$w)
+  hfi_scales_c$AIC[i] <- AIC(model_i)
+}
+for (i in 1:length(hfi_scales_c)) {
+  min_i <- min(hfi_scales_c$AIC)
+  hfi_scales_c$delta_AIC <- hfi_scales_c$AIC - min_i
+}
+
+hfi_scales_c[which(hfi_scales_c$AIC==min(hfi_scales_c$AIC)),]
+# hfi_800
+
+
+  ## canopy
+canopy_scales_c <- data.frame(covariate = "canopy",
+                              scale = seq(0,1000,by = 100),
+                              AIC = NA,
+                              delta_AIC = NA)
+
+for(i in 1:nrow(canopy_scales_c)){
+  cov_i <- paste0(canopy_scales_c$covariate[i],"_",canopy_scales_c$scale[i])
+  data_i <- coyote_canopy[,c("case_",cov_i)]
+  model_i <- glm(data_i[,1] ~ data_i[,2], data = data_i, family = poisson, weights = coyote_canopy$w)
+  canopy_scales_c$AIC[i] <- AIC(model_i)
+}
+for (i in 1:length(canopy_scales_c)) {
+  min_i <- min(canopy_scales_c$AIC)
+  canopy_scales_c$delta_AIC <- canopy_scales_c$AIC - min_i
+}
+
+canopy_scales_c[which(canopy_scales_c$AIC==min(canopy_scales_c$AIC)),]
+# canopy_0
+
+
+  ## elevation
+elev_scales_c <- data.frame(covariate = "elev",
+                            scale = seq(0,1000,by = 100),
+                            AIC = NA,
+                            delta_AIC = NA)
+
+for(i in 1:nrow(elev_scales_c)){
+  cov_i <- paste0(elev_scales_c$covariate[i],"_",elev_scales_c$scale[i])
+  data_i <- coyote_elev[,c("case_",cov_i)]
+  model_i <- glm(data_i[,1] ~ data_i[,2], data = data_i, family = poisson, weights = coyote_elev$w)
+  elev_scales_c$AIC[i] <- AIC(model_i)
+}
+for (i in 1:length(elev_scales_c)) {
+  min_i <- min(elev_scales_c$AIC)
+  elev_scales_c$delta_AIC <- elev_scales_c$AIC - min_i
+}
+
+elev_scales_c[which(elev_scales_c$AIC==min(elev_scales_c$AIC)),]
+# elev_600
+
+
+
+
+# bind scales of effect for all covariates and z-score standardize
+hfi_c <- dplyr::select(coyote_hfi, hfi_800) %>% 
+  mutate(zhfi_800 = scale(hfi_800))
+canopy_c <- dplyr::select(coyote_canopy, canopy_0) %>%
+  mutate(zcanopy_0 = scale(canopy_0))
+elev_c <- dplyr::select(.data = coyote_elev, elev_600) %>%
+  mutate(zelev_600 = scale(elev_600))
+trail_c <- raster::extract(trail, coyote_extract[,c("x2_","y2_")]) %>%
+  dplyr::select(-ID) %>% 
+  mutate(ztrail_dist = scale(trail_dist))
+
+coyote_extract1 <- cbind(hfi_c, canopy_c, elev_c, trail_c, 
+                         coyote_extract)
+
+
+# plot scales of effect
+par(mfrow=c(1,3))
+plot(delta_AIC ~ scale, hfi_scales_c,
+     type = "b",
+     xlab = "",
+     ylab = expression(paste(Delta, " AIC")),
+     main = "Human Footprint Index")
+plot(delta_AIC ~ scale, canopy_scales_c,
+     type = "b",
+     xlab = "Scale (buffer radius in meters)",
+     ylab = "",
+     main = "Percent Canopy Cover")
+plot(delta_AIC ~ scale, elev_scales_c,
+     type = "b",
+     xlab = "",
+     ylab = "",
+     main = "Elevation")
+
+mtext(expression(bold("Coyote Scales of Effect")),
+      at=-1000, line=3,
+      cex=1)
+par(mfrow=c(1,1))
+
+save.image("outputs/coyote_sof.png")
+
+
+# final touches before SSF
+bobcat_extract2 <- bobcat_extract1 %>% 
   # create unique step ID for each animal
-  mutate(step_id_ = paste(ID, step_id_, sep = "_"),
-         human_footprint = human_footprint,
-         canopy = canopy,
-         elevation = elevation) %>%
+  mutate(step_id_ = paste(ID, step_id_, sep = "_")) %>%
+  group_by(ID) %>% 
+  # calculate sample size for each animal (dividing by 11 because of available points)
+  mutate(n = n()/11) %>%
+  ungroup()
+coyote_extract2 <- coyote_extract1 %>% 
+  # create unique step ID for each animal
+  mutate(step_id_ = paste(ID, step_id_, sep = "_")) %>%
   group_by(ID) %>% 
   # calculate sample size for each animal (dividing by 11 because of available points)
   mutate(n = n()/11) %>%
   ungroup()
 
-coy_stp2 <- coy_stp1 %>% 
-  # create unique step ID for each animal
-  mutate(step_id_ = paste(ID, step_id_, sep = "_"),
-         human_footprint = human_footprint,
-         canopy = canopy,
-         elevation = elevation) %>%
-  group_by(ID) %>% 
-  # calculate sample size for each animal (dividing by 11 because of available points)
-  mutate(n = n()/11) %>%
-  ungroup()
+# save fully processed data for SSF
+saveRDS(bobcat_extract2, "outputs/bobcat_covariates.rds")
+saveRDS(coyote_extract2, "outputs/coyote_covariates.rds")
 
-# Save fully processed data for SSF
-saveRDS(bob_stp2, "outputs/bob_stp2.rds")
-saveRDS(coy_stp2, "outputs/coy_stp2.rds")
+
+
 
 #### Fit Models ####
+rm(list=ls())
 
-library(parallel)
 library(glmmTMB)
+library(doParallel)
 
-ncore <- min(parallel::detectCores()) - 2
-
-# read fully processed data for SSFs
-coy_ssf_dat <- readRDS("outputs/coy_stp2.rds")  %>% 
-  # select coyotes with more than 100 fixes
+bob_ssf_dat <- readRDS("outputs/bobcat_covariates.rds")  %>%
+  mutate(log_sl_ = log(sl_),                                   # fix above and remove eventually
+         cos_ta_ = cos(ta_)) %>% 
+  # select individuals with more than 100 fixes
   filter(n >= 100)
 
+# set number of cores
+nt <- min(detectCores()) - 2
 
+# fit mixed-effects SSF
+bob_ssf <-  glmmTMB(case_ ~ zhfi_800 + zcanopy_0 + ztrail_dist + zelev_200 +
+                      (1|step_id_) + (0 + zhfi_800 | ID) + (0 + zcanopy_0 | ID) + (0 + ztrail_dist | ID) + (0 + zelev_200 | ID) +
+                      log_sl_ + (0 + log_sl_ | ID) + cos_ta_ + (0 + cos_ta_ | ID),
+                    family=poisson,
+                    weights = w,
+                    doFit=T,
+                    data = bob_ssf_dat,
+                    control = glmmTMBControl(parallel = nt))
 
-# fit SSF using glmmTB
-glmmTMB_coy <-  glmmTMB(case_ ~ human_footprint + I(human_footprint^2) + (0 + human_footprint | ID) + (0 + I(human_footprint^2) | ID) + 
-                          canopy + I(canopy^2) + (0 + canopy | ID) + (0 + I(canopy^2) | ID) +
-                          elevation + I(elevation^2) + (0 + elevation | ID) + (0 + I(elevation^2) | ID) +
-                          # control for step length
-                          log_sl + (0 + log_sl | ID) + 
-                          # strata
-                          (1|step_id_),
-                        family=poisson, doFit=T,
-                        data = coy_ssf_dat, 
-                        # Tell glmmTMB not to change the last standard deviation, all other values are estimated freely
-                        map = list(theta = factor(c(1:9, NA))),
-                        # Set the value of the standard deviation of the strata (the last ranef) to large constant value
-                        start = list(theta = c(rep(0, times = 9),log(1000))),
-                        control = glmmTMBControl(parallel = ncore)) 
-#saveRDS(glmmTMB_coy, "Analysis/glmmTMB_coy_20230215_minusToPlusScale.rds")
-#glmmTMB_coy <- readRDS("Analysis/glmmTMB_coy_20230215_minusToPlusScale.rds")
-summary(glmmTMB_coy)
+summary(bob_ssf)
 
