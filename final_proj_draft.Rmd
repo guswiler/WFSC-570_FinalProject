@@ -438,12 +438,17 @@ bob_vect <- meso %>%
 
 coy_vect <- meso %>% 
   filter(Species == "COY") %>% 
-  vect(geom=c("Long", "Lat"), crs="EPSG:4326")
+  vect(geom=c("E", "N"), crs="EPSG:32610")
+
+trail_vect <- rast("rasters/trail_raster.tif") %>% 
+  # reproject to appropriate crs
+  project("EPSG:32610", method = "bilinear") %>% 
+  vect()
 
 trail_vect <- vect("data_raw/Trails/Trails.shp")
 
 
-plot(hfi, col = map.pal("sepia"),
+plot(trail, col = map.pal("sepia"),
      main = "Human Footprint")
 lines(trail_vect, lwd = 0.4,
      col = "brown2")
